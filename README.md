@@ -1,2 +1,2 @@
 # F1bi-PADS
-Project development to Fundação 1bi, as part of the PADS course from Insper.
+Project developed to Fundação 1bi, as part of Insper's PADS course.
