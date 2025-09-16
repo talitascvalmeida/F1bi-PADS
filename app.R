@@ -199,39 +199,72 @@ resolve_champ_dir <- function(){
   valid[which.max(file.info(valid)$mtime)]
 }
 
+# ======== NOVO: carrega catálogo priorizando aulas_aprendizap.csv ========
 load_catalog <- function(champ_dir){
-  candidates <- c(file.path(champ_dir, "catalog_items.parquet"),
-                  file.path(champ_dir, "catalog_items.csv"),
-                  "stg_formation.csv")
+  candidates <- c(
+    file.path(champ_dir, "catalog_items.parquet"),
+    file.path(champ_dir, "catalog_items.csv"),
+    file.path(champ_dir, "aulas_aprendizap.parquet"),
+    file.path(champ_dir, "aulas_aprendizap.csv"),
+    file.path("data",      "aulas_aprendizap.parquet"),
+    file.path("data",      "aulas_aprendizap.csv"),
+    "aulas_aprendizap.parquet",
+    "aulas_aprendizap.csv",
+    "stg_formation.csv"
+  )
+
+  read_any <- function(p){
+    ext <- tolower(tools::file_ext(p))
+    if (ext == "parquet") as.data.frame(arrow::read_parquet(p)) else
+      suppressMessages(readr::read_csv(p, show_col_types = FALSE, progress = FALSE))
+  }
+
+  first_present <- function(cands, pool){
+    pool_l <- tolower(pool)
+    for (c in cands){
+      pos <- match(tolower(c), pool_l)
+      if (!is.na(pos)) return(pool[pos])
+    }
+    NULL
+  }
+
   for (p in candidates){
     if (!file.exists(p)) next
-    ext <- tolower(tools::file_ext(p))
-    raw <- tryCatch({
-      if (ext == "parquet") as.data.frame(arrow::read_parquet(p))
-      else suppressMessages(readr::read_csv(p, show_col_types = FALSE, progress = FALSE))
-    }, error = function(e) NULL)
+    raw <- tryCatch(read_any(p), error = function(e) NULL)
     if (is.null(raw) || nrow(raw) == 0) next
+
     cols <- colnames(raw)
-    first_present <- function(cands, pool){
-      pool_l <- tolower(pool)
-      for (c in cands){
-        pos <- match(tolower(c), pool_l)
-        if (!is.na(pos)) return(pool[pos])
-      }
-      NULL
-    }
-    col_item <- first_present(c("itemId","id_aula","conteudo_id","content_id","lesson_id","id"), cols)
-    col_name <- first_present(c("itemName","titulo","titulo_conteudo","nome_conteudo","name","title","descricao","description"), cols)
+
+    # mapeamento específico: lesson_id -> itemId | lesson_title -> itemName | disciplina
+    col_item <- first_present(c("itemId","lesson_id","id_aula","conteudo_id","content_id","lesson_id","id"), cols)
+    col_name <- first_present(c("itemName","lesson_title","titulo","name","title","descricao","description"), cols)
     col_url  <- first_present(c("itemUrl","url","link","href"), cols)
+    col_disc <- first_present(c("disciplina","subject","materia"), cols)
+
     if (is.null(col_item) || is.null(col_name)) next
-    keep_cols <- c(col_item, col_name, col_url)[!sapply(list(col_item,col_name,col_url), is.null)]
-    out <- raw[, keep_cols, drop = FALSE]
-    names(out)[1:2] <- c("itemId","itemName"); if (!is.null(col_url)) names(out)[3] <- "itemUrl"
-    out$itemId <- as.character(out$itemId); out$itemName <- as.character(out$itemName)
-    if ("itemUrl" %in% names(out)) out$itemUrl <- as.character(out$itemUrl)
-    out <- out |> tidyr::drop_na(itemId, itemName) |> dplyr::distinct(itemId, .keep_all = TRUE)
+
+    keep <- c(col_item, col_name, col_url, col_disc)
+    keep <- keep[!sapply(keep, is.null)]
+    out  <- raw[, keep, drop = FALSE]
+
+    names(out)[match(col_item, names(out))] <- "itemId"
+    names(out)[match(col_name, names(out))] <- "itemName"
+    if (!is.null(col_url))  names(out)[match(col_url,  names(out))] <- "itemUrl"
+    if (!is.null(col_disc)) names(out)[match(col_disc, names(out))] <- "disciplina"
+
+    out$itemId   <- as.character(out$itemId)
+    out$itemName <- as.character(out$itemName)
+    if ("itemUrl"    %in% names(out)) out$itemUrl    <- as.character(out$itemUrl)
+    if ("disciplina" %in% names(out)) out$disciplina <- as.character(out$disciplina)
+
+    out <- out |>
+      tidyr::drop_na(itemId, itemName) |>
+      dplyr::distinct(itemId, .keep_all = TRUE)
+
     if (nrow(out) > 0) return(out)
   }
+
+  # fallback vazio (app mostrará IDs cru se não achar catálogo)
   tibble::tibble(itemId = character(), itemName = character(), itemUrl = character())
 }
 
@@ -343,26 +376,39 @@ recommend_user_batch <- function(user_ids, k = TOPK){
     recs <- recommend_known_user(uid, k = k)
     if (is.null(recs) || nrow(recs) == 0)
       return(tibble(userId = uid, rank = integer(), itemId = character(), itemName = character(), score = numeric()))
-    recs %>% mutate(userId = uid, .before = 1) %>% select(userId, rank, itemId, itemName, score)
+    recs %>% mutate(userId = uid, .before = 1) %>% select(userId, rank, itemId, itemName, score, dplyr::any_of(c("disciplina")))
   })
   bind_rows(rows)
 }
 
 # =======================
-# Formatação p/ UI (trunca Item)
+# Formatação p/ UI (exibe 'lesson_title — disciplina')
 # =======================
 format_table <- function(df){
   if (is.null(df) || nrow(df) == 0) return(tibble())
   out <- df %>% mutate(rank = as.integer(rank))
+
   # Símbolos circundados (1..10)
   rank_chr <- as.character(out$rank)
   out$Rank <- ifelse(rank_chr %in% names(CIRCLED), CIRCLED[rank_chr], rank_chr)
-  # Trunca item
-  txt <- as.character(out$itemName)
+
+  # Nome legível + disciplina
+  base_name <- ifelse(is.na(out$itemName) | out$itemName == "", as.character(out$itemId), out$itemName)
+  if ("disciplina" %in% names(out)){
+    disc_suf <- ifelse(is.na(out$disciplina) | out$disciplina == "", "", paste0(" — ", out$disciplina))
+  } else {
+    disc_suf <- ""
+  }
+  txt <- paste0(base_name, disc_suf)
+
+  # Trunca texto para caber no card
   too_long <- nchar(txt, type = "width") > MAX_ITEM_CHARS
   txt[too_long] <- paste0(str_sub(txt[too_long], 1, MAX_ITEM_CHARS - 1), "…")
   out$Item <- txt
+
+  # Score (se houver)
   if ("score" %in% names(out)) out$Score <- round(as.numeric(out$score), 4)
+
   cols <- c("Rank","Item","Score")
   out[, intersect(cols, names(out)), drop = FALSE]
 }
@@ -443,14 +489,26 @@ server <- function(input, output, session){
     if (length(uids) == 0) return(tibble(erro = "Nenhum userId válido encontrado."))
     out <- recommend_user_batch(uids, k = TOPK)
     cache(out)
+
+    # Preview formatado (mesma lógica do format_table, mas preserva userId)
     prev <- out %>% group_by(userId) %>% slice_head(n = TOPK) %>% ungroup()
-    # Rank circundado + truncagem
+
     prev$Rank <- ifelse(as.character(prev$rank) %in% names(CIRCLED),
                         CIRCLED[as.character(prev$rank)], as.character(prev$rank))
-    txt <- as.character(prev$itemName)
+
+    base_name <- ifelse(is.na(prev$itemName) | prev$itemName == "",
+                        as.character(prev$itemId), prev$itemName)
+    if ("disciplina" %in% names(prev)){
+      disc_suf <- ifelse(is.na(prev$disciplina) | prev$disciplina == "", "", paste0(" — ", prev$disciplina))
+    } else {
+      disc_suf <- ""
+    }
+    txt <- paste0(base_name, disc_suf)
+
     too_long <- nchar(txt, type = "width") > MAX_ITEM_CHARS
     txt[too_long] <- paste0(str_sub(txt[too_long], 1, MAX_ITEM_CHARS - 1), "…")
     prev$Item <- txt
+
     prev$Score <- round(as.numeric(prev$score), 4)
     prev %>% select(userId, Rank, Item, Score)
   })
@@ -471,6 +529,10 @@ server <- function(input, output, session){
       div(
         "Aviso: catálogo de nomes de itens não encontrado. ",
         "Os itens aparecem como IDs. Para nomes legíveis, exporte ",
+        tags$code("aulas_aprendizap.csv"),
+        " (colunas ",
+        tags$code("lesson_id, lesson_title, disciplina"),
+        ") ou ",
         tags$code("catalog_items.parquet|csv"),
         " com colunas ",
         tags$code("itemId,itemName[,itemUrl]"),
@@ -484,4 +546,4 @@ server <- function(input, output, session){
 shinyApp(ui, server)
 
 app <- shiny::shinyApp(ui = ui, server = server)
-app 
+app

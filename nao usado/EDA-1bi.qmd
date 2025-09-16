@@ -1,0 +1,559 @@
+---
+title: "Untitled"
+format: html
+---
+```{r}
+install.packages("pak", repos = "https://r-lib.github.io/p/pak/dev/")
+````
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+```
+
+```{r}
+pak::pak("jtrecenti/aprendizap")
+````
+
+
+```{r}
+library(aprendizap)
+azap_list()
+```
+
+```{r}
+dim_teachers <- azap_read(
+    "dim_teachers.parquet"
+)
+```
+
+```{r}
+dplyr::glimpse(dim_teachers)
+```
+
+```{r}
+df_entries <- azap_read(
+    "fct_teachers_entries.parquet"
+)
+```
+
+```{r}
+dplyr::glimpse(df_entries)
+```
+
+```{r}
+df_entries <- df_entries %>%
+  mutate(
+    duracao_segundos = as.numeric(difftime(data_fim, data_inicio, units = "secs")),
+    duracao_minutos  = as.numeric(difftime(data_fim, data_inicio, units = "mins")),
+    duracao_horas    = as.numeric(difftime(data_fim, data_inicio, units = "hours"))
+  )
+  ```
+
+  ```{r}
+  head(df_entries)
+  ```
+
+  ```{r}
+ media_por_mes <- df_entries %>%
+  mutate(
+    data_inicio = as.POSIXct(data_inicio, tz = "America/Sao_Paulo"),
+    # transforma para o 1º dia do mês e já em Date
+    mes = as.Date(floor_date(data_inicio, unit = "month")),
+    ano = year(data_inicio)
+  ) %>%
+  group_by(ano, mes) %>%
+  summarise(
+    n_sessoes     = n(),
+    media_seg     = mean(duracao_segundos, na.rm = TRUE),
+    mediana_seg   = median(duracao_segundos, na.rm = TRUE),
+    p90_seg       = quantile(duracao_segundos, 0.90, na.rm = TRUE),
+    desvio_padrao = sd(duracao_segundos, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(ano, mes)
+
+media_por_mes
+```
+
+```{r}
+ggplot(media_por_mes, aes(x = mes, y = media_seg/60)) +  # minutos
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_date(date_labels = "%b/%Y", date_breaks = "1 month") +
+  labs(title = "Média de tempo de sessão por mês",
+       x = "Mês", y = "Tempo médio (min)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+df_entries %>%
+  distinct(user_type) %>%
+  arrange(user_type)
+```
+
+```{r}
+df_entries <- df_entries %>%
+  left_join(dim_teachers, by = "unique_id")
+```
+
+```{r}
+df_join <- df_entries %>%
+  mutate(
+    data_inicio = as.POSIXct(data_inicio, tz = "America/Sao_Paulo"),
+    data_fim    = as.POSIXct(data_fim, tz = "America/Sao_Paulo"),
+    duracao_min = as.numeric(difftime(data_fim, data_inicio, units = "mins"))
+  ) %>%
+  filter(!is.na(duracao_min), duracao_min > 0, duracao_min <= 480) # remove outliers >8h
+```
+
+```{r}
+stats_por_subject <- df_join %>%
+  group_by(currentstage) %>%
+  summarise(
+    n_sessoes    = n(),
+    media_min    = mean(duracao_min),
+    mediana_min  = median(duracao_min),
+    p90_min      = quantile(duracao_min, 0.9),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(media_min))
+
+stats_por_subject
+
+```
+
+```{r}
+
+df_clean <- df_join %>%
+  tidyr::drop_na()
+
+```
+
+```{r} 
+media_mes_stage <- df_clean %>%
+  mutate(
+    mes = as.Date(floor_date(data_inicio, unit = "month"))  # garante tipo Date
+  ) %>%
+  group_by(mes, currentstage) %>%
+  summarise(
+    media_min = mean(duracao_min, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+ggplot(media_mes_stage,
+       aes(x = mes, y = media_min, color = currentstage, group = currentstage)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.6) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m") +
+  labs(
+    x = "Mês",
+    y = "Tempo médio de sessão (min)",
+    color = "Etapa (currentstage)",
+    title = "Tempo médio de sessão por mês e etapa"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+##Há algum perfil de professor que usa pouco ou muito a plataforma?
+```{r}
+# Conta quantas sessões cada professor teve por mês
+sessoes_por_prof <- df_clean %>%
+  mutate(
+    mes = floor_date(data_inicio, unit = "month")
+  ) %>%
+  group_by(unique_id, mes) %>%
+  summarise(qtd_sessoes = n(), .groups = "drop") %>%
+  # Classifica em faixas
+  mutate(faixa_uso = case_when(
+    qtd_sessoes <= 1 ~ "0–1 sessão/mês",
+    qtd_sessoes <= 5 ~ "2–5 sessões/mês",
+    TRUE ~ "6+ sessões/mês"
+  ))
+
+# Resumo: quantos professores em cada faixa
+resumo_faixas <- sessoes_por_prof %>%
+  group_by(faixa_uso) %>%
+  summarise(
+    professores = n_distinct(unique_id),
+    .groups = "drop"
+  )
+
+print(resumo_faixas)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(sessoes_por_prof, aes(x = faixa_uso)) +
+  geom_bar(fill = "#2C3E50") +
+  labs(
+    title = "Distribuição de professores por faixa de sessões/mês",
+    x = "Faixa de uso",
+    y = "Número de ocorrências (professor-mês)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# 1) Sessões por professor-mês + faixa de uso
+sessoes_prof_mes <- df_clean %>%
+  mutate(mes = floor_date(data_inicio, "month")) %>%
+  group_by(unique_id, mes, currentsubject, currentstage) %>%
+  summarise(qtd_sessoes = n(), .groups = "drop") %>%
+  mutate(faixa_uso = case_when(
+    qtd_sessoes <= 0 ~ "0 sessão/mês",
+    qtd_sessoes >= 1 & qtd_sessoes <= 2 ~ "1-2 sessão/mês",
+    qtd_sessoes >= 3 & qtd_sessoes <= 4 ~ "3-4 sessões/mês",
+    TRUE             ~ "4+ sessões/mês"
+  )) %>%
+  mutate(faixa_uso = factor(faixa_uso,
+                            levels = c("0–1 sessão/mês","2–5 sessões/mês","6+ sessões/mês")))
+
+# 2) Distribuição por SUBJECT (oportunidades = onde há mais 0–1)
+dist_subject <- sessoes_prof_mes %>%
+  count(currentsubject, faixa_uso, name = "prof_mes") %>%
+  group_by(currentsubject) %>%
+  mutate(total = sum(prof_mes),
+         pct   = prof_mes/total) %>%
+  ungroup() %>%
+  arrange(currentsubject, faixa_uso)
+
+# Top oportunidades por SUBJECT (maior % em 0–1)
+top_op_subject <- dist_subject %>%
+  filter(faixa_uso == "0 sessão/mês") %>%
+  arrange(desc(pct)) %>%
+  slice_head(n = 10)
+```
+```{r}
+# 3) Distribuição por STAGE
+dist_stage <- sessoes_prof_mes %>%
+  count(currentstage, faixa_uso, name = "prof_mes") %>%
+  group_by(currentstage) %>%
+  mutate(total = sum(prof_mes),
+         pct   = prof_mes/total) %>%
+  ungroup() %>%
+  arrange(currentstage, faixa_uso)
+
+# Top oportunidades por STAGE
+top_op_stage <- dist_stage %>%
+  filter(faixa_uso == "0 sessão/mês") %>%
+  arrange(desc(pct)) %>%
+  slice_head(n = 10)
+```
+```{r}
+# Marca quais unique_id têm sessões
+usuarios_com_login <- df_entries %>%
+  distinct(unique_id) %>%
+  mutate(teve_login = TRUE)
+
+# Junta com a base de cadastro
+usuarios_sem_login <- dim_teachers %>%
+  left_join(usuarios_com_login, by = "unique_id") %>%
+  filter(is.na(teve_login))  # nunca logaram
+
+# Contagem
+n_usuarios_sem_login <- nrow(usuarios_sem_login)
+print(n_usuarios_sem_login)
+
+# Visualização de perfil
+usuarios_sem_login %>%
+  count(currentstage, currentsubject, sort = TRUE)
+```
+
+```{r}
+# Junta com a base de cadastro
+usuarios_sem_login_ano <- dim_teachers %>%
+  left_join(usuarios_com_login, by = "unique_id") %>%
+  filter(is.na(teve_login)) %>%
+  mutate(mes_ano_cadastro = floor_date(data_entrada, unit = "month"))
+
+# Contagem por ano
+usuarios_sem_login_ano %>%
+  count(mes_ano_cadastro, sort = TRUE)
+
+# Gráfico
+library(ggplot2)
+usuarios_sem_login_ano %>%
+  count(mes_ano_cadastro) %>%
+  ggplot(aes(x = mes_ano_cadastro, y = n)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Usuários sem login por ano de cadastro",
+    x = "Ano de cadastro", y = "Quantidade"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# 2) Inativos = estão em dim_teachers mas nunca apareceram em entries
+usuarios_sem_login <- dim_teachers %>%
+  left_join(usuarios_com_login, by = "unique_id") %>%
+  filter(is.na(teve_login)) %>%
+  filter(!is.na(data_entrada)) %>%
+  mutate(mes = as.Date(floor_date(as.POSIXct(data_entrada, tz = "America/Sao_Paulo"),
+                                  unit = "month")))
+
+# 3) Totais por mês (todas as contas criadas no mês)
+total_mes <- dim_teachers %>%
+  filter(!is.na(data_entrada)) %>%
+  mutate(mes = as.Date(floor_date(as.POSIXct(data_entrada, tz = "America/Sao_Paulo"),
+                                  unit = "month"))) %>%
+  count(mes, name = "total")
+
+# 4) Inativos por mês
+inativos_mes <- usuarios_sem_login %>%
+  count(mes, name = "inativos")
+
+# 5) Proporção (% inativos / total do mês)
+inativos_pct <- total_mes %>%
+  left_join(inativos_mes, by = "mes") %>%
+  mutate(
+    inativos = replace_na(inativos, 0),
+    pct_inativos = inativos / total
+  ) %>%
+  arrange(mes)
+
+inativos_pct
+```
+```{r}
+ggplot(inativos_pct, aes(x = mes, y = pct_inativos)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m") +
+  labs(title = "% de contas sem login por mês de cadastro",
+       x = "Mês de cadastro", y = "% inativos") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+library(scales)
+library(forcats) 
+```
+```{r}
+max_age <- 12  # ajuste conforme precisar
+
+# 1) Cohort = mês de ENTRADA
+usuarios <- dim_teachers %>%
+  filter(!is.na(data_entrada)) %>%
+  transmute(
+    unique_id,
+    cohort = as.Date(floor_date(as.POSIXct(data_entrada, tz = "America/Sao_Paulo"), "month"))
+  )
+
+# 2) Primeiro login (mês)
+primeiro_login <- df_entries %>%
+  group_by(unique_id) %>%
+  summarise(
+    first_login = as.Date(floor_date(min(as.POSIXct(data_inicio, tz = "America/Sao_Paulo")), "month")),
+    .groups = "drop"
+  )
+
+# 3) Junta e calcula idade de ativação (em meses)
+u <- usuarios %>% left_join(primeiro_login, by = "unique_id")
+
+cohort_totais <- u %>% count(cohort, name = "cohort_size")
+
+act_counts <- u %>%
+  mutate(
+    act_age = if_else(
+      is.na(first_login),
+      NA_integer_,
+      (year(first_login) - year(cohort)) * 12L + (month(first_login) - month(cohort))
+    ),
+    # se por algum motivo o first_login cair antes do cohort, clamp em 0
+    act_age = if_else(!is.na(act_age) & act_age < 0L, 0L, act_age)
+  ) %>%
+  filter(!is.na(act_age)) %>%             # só quem ativou
+  count(cohort, act_age, name = "n_activated_at_age")
+
+# 4) Grade só de cohort x idade (pequena)
+grid <- cohort_totais %>%
+  select(cohort) %>%
+  tidyr::expand(cohort, age = 0:max_age)
+
+# 5) % inativos por cohort x idade (1 - cumulativo de ativados / tamanho do cohort)
+cohort_heat <- grid %>%
+  left_join(act_counts, by = c("cohort" = "cohort", "age" = "act_age")) %>%
+  mutate(n_activated_at_age = tidyr::replace_na(n_activated_at_age, 0L)) %>%
+  group_by(cohort) %>%
+  arrange(age, .by_group = TRUE) %>%
+  mutate(cum_activated = cumsum(n_activated_at_age)) %>%
+  left_join(cohort_totais, by = "cohort") %>%
+  mutate(pct_inactive = 1 - cum_activated / cohort_size) %>%
+  ungroup()
+```
+```{r}
+ggplot(cohort_heat,
+       aes(x = age,
+           y = fct_rev(fct_inorder(factor(format(cohort, "%Y-%m")))),
+           fill = pct_inactive)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "firebrick",
+                      labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Cohort Heatmap — % ainda inativos (nunca logaram até o mês-idade)",
+    x = "Meses desde a entrada",
+    y = "Cohort (mês de entrada)",
+    fill = "% inativos"
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8))
+```
+```{r}
+max_age <- 12
+mes_atual <- as.Date(floor_date(Sys.time(), "month"))
+
+# 1) Cohort por mês de ENTRADA
+usuarios <- dim_teachers %>%
+  filter(!is.na(data_entrada)) %>%
+  transmute(
+    unique_id,
+    cohort = as.Date(floor_date(as.POSIXct(data_entrada, tz="America/Sao_Paulo"), "month"))
+  )
+
+# 2) Primeiro login (apenas registered)
+primeiro_login <- df_entries %>%
+  filter(is.na(user_type) | user_type == "registered") %>%  # se não houver user_type, remove esse filtro
+  group_by(unique_id) %>%
+  summarise(first_login = as.Date(floor_date(min(as.POSIXct(data_inicio, tz="America/Sao_Paulo")), "month")),
+            .groups = "drop")
+
+# 3) Junta e calcula idade de ativação
+u <- usuarios %>% left_join(primeiro_login, by="unique_id")
+
+cohort_totais <- u %>% count(cohort, name="cohort_size") %>%
+  filter(cohort_size >= 50)  # threshold opcional
+
+act_counts <- u %>%
+  mutate(
+    act_age = if_else(
+      is.na(first_login), NA_integer_,
+      (year(first_login)-year(cohort))*12L + (month(first_login)-month(cohort))
+    ),
+    act_age = if_else(!is.na(act_age) & act_age < 0L, 0L, act_age)
+  ) %>%
+  inner_join(cohort_totais, by="cohort") %>%   # mantém só cohorts com tamanho OK
+  filter(!is.na(act_age)) %>%
+  count(cohort, act_age, name="n_activated_at_age")
+
+grid <- cohort_totais %>%
+  select(cohort) %>%
+  tidyr::expand(cohort, age = 0:max_age) %>%
+  # censura: não mostrar idade além do mês atual
+  mutate(max_age_obs = (year(mes_atual)-year(cohort))*12L + (month(mes_atual)-month(cohort))) %>%
+  filter(age <= pmax(0L, max_age_obs)) %>%
+  select(-max_age_obs)
+
+cohort_heat <- grid %>%
+  left_join(act_counts, by=c("cohort"="cohort","age"="act_age")) %>%
+  mutate(n_activated_at_age = tidyr::replace_na(n_activated_at_age, 0L)) %>%
+  left_join(cohort_totais, by="cohort") %>%
+  group_by(cohort) %>%
+  arrange(age, .by_group=TRUE) %>%
+  mutate(
+    cum_activated = cumsum(n_activated_at_age),
+    pct_inactive  = 1 - cum_activated / cohort_size
+  ) %>%
+  ungroup()
+
+ggplot(cohort_heat,
+       aes(x = age,
+           y = fct_rev(fct_inorder(factor(format(cohort, "%Y-%m")))),
+           fill = pct_inactive)) +
+  geom_tile() +
+  scale_fill_gradient(limits=c(0,1), breaks=seq(0,1,0.25),
+                      labels = percent_format(accuracy=1),
+                      low="white", high="firebrick") +
+  labs(title="Cohort Heatmap — % ainda inativos",
+       x="Meses desde a entrada", y="Cohort (mês de entrada)", fill="% inativos") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size=8))
+```
+```{r}
+ggplot(cohort_heat,
+       aes(x = age,
+           y = factor(format(cohort, "%Y-%m"), levels = rev(sort(unique(format(cohort, "%Y-%m"))))),
+           fill = pct_inactive)) +
+  geom_tile() +
+  scale_fill_stepsn(
+    colours = rev(RColorBrewer::brewer.pal(7, "YlOrRd")),
+    breaks  = c(.50,.75,.85,.90,.95,.98,1.00),
+    labels  = percent_format(accuracy = 1),
+    limits  = c(.50, 1.00), oob = squish
+  ) +
+  labs(title = "Cohort Heatmap — % ainda inativos",
+       x = "Meses desde a entrada", y = "Cohort (mês de entrada)", fill = "% inativos") +
+  theme_minimal()
+```
+```{r}
+# 1) Seleciona marcos (D30=age 1, D90=age 3, D180=age 6) e filtra cohorts que já "viveram" o marco
+bars <- cohort_heat %>%
+  filter(age %in% c(1L, 3L, 6L)) %>%
+  group_by(cohort) %>%
+  mutate(max_age_obs = max(age)) %>%
+  ungroup() %>%
+  mutate(
+    milestone = recode(age, `1` = "D30", `3` = "D90", `6` = "D180"),
+    pct_active = 1 - pct_inactive
+  ) %>%
+  filter( (milestone == "D30"  & max_age_obs >= 1) |
+          (milestone == "D90"  & max_age_obs >= 3) |
+          (milestone == "D180" & max_age_obs >= 6) )
+
+# 2) (Opcional) manter só os N cohorts mais recentes para leitura
+last_n <- 12
+recent_levels <- bars %>%
+  distinct(cohort) %>%
+  arrange(desc(cohort)) %>%
+  slice_head(n = last_n) %>%
+  pull(cohort)
+
+bars_recent <- bars %>%
+  filter(cohort %in% recent_levels) %>%
+  mutate(cohort_lab = factor(format(cohort, "%Y-%m"),
+                             levels = format(rev(sort(recent_levels)), "%Y-%m")))
+
+# 3A) Barras — % INATIVOS por cohort
+ggplot(bars_recent,
+       aes(x = cohort_lab, y = pct_inactive)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ milestone, ncol = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0,1)) +
+  labs(title = "% de inativos por cohort (D30 / D90 / D180)",
+       x = "Cohort (mês de entrada)", y = "% inativos") +
+  theme_minimal(base_size = 11)
+
+# 3B) Barras — % ATIVADOS por cohort (às vezes dá contraste melhor)
+ggplot(bars_recent,
+       aes(x = cohort_lab, y = pct_active)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  facet_wrap(~ milestone, ncol = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0,1)) +
+  labs(title = "% de ativados por cohort (D30 / D90 / D180)",
+       x = "Cohort (mês de entrada)", y = "% ativados") +
+  theme_minimal(base_size = 11)
+
+# 4) Tabela resumida (útil para priorização)
+tabela_marcos <- bars %>%
+  transmute(
+    cohort = format(cohort, "%Y-%m"),
+    milestone,
+    cohort_size,
+    pct_inativos = pct_inactive,
+    pct_ativados = pct_active
+  ) %>%
+  arrange(milestone, desc(pct_inativos))
+
+tabela_marcos
+```

@@ -1,0 +1,4 @@
+^.*
+!app.R
+!artifacts/champ_20250915_2208/**
+!artifacts/CHAMP_POINTER.txt
