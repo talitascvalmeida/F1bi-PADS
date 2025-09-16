@@ -1,0 +1,454 @@
+---
+title: "Fundação 1Bi - Recomendador Conteúdo — Notebook Quarto (Python)" 
+author: "Marcel, Talita" 
+date: today 
+format: html
+toc: true 
+toc-depth: 3 
+number-sections: true 
+code-fold: show 
+code-tools: true 
+toc: true 
+number-sections: true 
+editor: visual 
+echo: true 
+warning: false 
+message: false 
+jupyter: python3
+---
+
+## Objetivo
+
+### Objetivo de negócio:
+
+Aumentar a retenção inicial (2º e 3º login) entregando recomendações mais relevantes nos primeiros acessos.
+
+### Objetivo técnico:
+
+Este notebook documenta, de ponta a ponta, um baseline de filtro colaborativo por ALS para recomendação de conteúdos no AprendiZAP/1Bi, incluindo preparação de dados, treino, avaliação (P\@K, R\@K, R\@10 com IC95% por bootstrap) e comparação com Popularidade. O foco é clareza reprodutível.
+
+------------------------------------------------------------------------
+
+### 1. Setup do ambiente
+
+#### 1.1 Dependências (instalação única)
+
+```{python}
+import sys
+!{sys.executable} -m pip install -U pip setuptools wheel \
+    "pandas>=2.2,<3.0" pyarrow numpy matplotlib seaborn scikit-learn implicit tqdm
+```
+
+#### 1.2 Imports
+
+```{python}
+import numpy as np
+import pandas as pd
+from scipy.sparse import csr_matrix
+
+import implicit
+from implicit.nearest_neighbours import bm25_weight
+
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from scipy.sparse import coo_matrix
+
+# fixar semente
+RNG_SEED = 42
+np.random.seed(RNG_SEED)
+```
+
+### 2. Dados & Pré-processamento
+
+```{python}
+dim_teachers = pd.read_csv('dim_teachers.csv')
+df = pd.read_csv('fct_teachers_contents_interactions.csv')
+fct_entries = pd.read_csv('fct_teachers_entries.csv')
+stg_formation = pd.read_csv('stg_formation.csv')
+stg_mari_ia_conversation = pd.read_csv('stg_mari_ia_conversation.csv')
+stg_mari_ia_reports = pd.read_csv('stg_mari_ia_reports.csv')
+```
+
+#### Feature Engineering
+
+```{python}
+print(df.columns.tolist())
+```
+
+**Tratamento de Nulos**
+
+```{python}
+# Contar nulos por coluna
+null_counts = df.isnull().sum()
+
+# Proporção de nulos (%)
+null_percent = df.isnull().mean() * 100
+
+# Juntar em uma tabela organizada
+null_report = pd.DataFrame({
+    "nulos": null_counts,
+    "percentual": null_percent.round(2)
+}).sort_values("percentual", ascending=False)
+
+print(null_report)
+```
+
+Como `event_type` possui apenas 3.71% de nulos e essa vai ser uma das variáveis principais do modelo, optamos por excluí-las.
+
+```{python}
+df_clean = df.dropna(subset=['event_type'])
+```
+
+```{python}
+# Se df_clean for Series, vira DataFrame
+tmp = df_clean if isinstance(df_clean, pd.DataFrame) else df_clean.to_frame()
+
+# Contagem e % de nulos por coluna
+null_counts  = tmp.isna().sum(axis=0)                   # Series
+null_percent = (tmp.isna().mean(axis=0) * 100).round(2) # Series
+
+# Tabela final
+null_report = (
+    pd.concat(
+        [null_counts.rename('nulos'),
+         null_percent.rename('percentual')],
+        axis=1
+    )
+    .sort_values('percentual', ascending=False)
+    .astype({'nulos': 'int64'})
+)
+
+# Deixar a coluna com o nome explícito
+null_report = null_report.reset_index().rename(columns={'index': 'coluna'})
+
+print(null_report)
+
+```
+
+**Clusterização dos `event_type`**
+
+```{python}
+counts = df_clean['event_type'].value_counts(dropna=False).reset_index()
+counts.columns = ['event_type', 'count']
+
+print(counts)
+```
+
+```{python}
+weight_map = {
+   "visualizacao_aula": 0.05, "visualizacao_prova": 0.05, "visualizacao_avaliacao": 0.05,
+    "visualizacao_metodologia_ativa": 0.05, "visualizacao_conteudo_ia": 0.05, "visualizacao_plano_aula": 0.05,
+
+    "acesso_aba_conquistas": 0.2, "click_selo_conquista": 0.2,
+    "click_link_missao_aulas": 0.2, "click_link_missao_comunidade": 0.2,
+    "click_link_missao_relatorio_turma": 0.2, "click_link_missao_mari": 0.2,
+    "click_link_missao_plano_de_aula": 0.2, "click_link_missao_blog": 0.2,
+
+    "download_aula": 0.8, "download_avaliacao": 0.8, "download_conteudo_ia": 0.8, "download_plano_aula": 0.8,
+
+    "compartilhamento_direto": 1.5, "botao_compartilhar_conquista_modal": 1.5,
+    "botao_compartilhar_conquista_completada": 1.5,
+
+    "criacao_plano_aula": 3.0, "botao_criar_plano_aula": 3.0, "rascunho_plano_aula": 3.0,
+    "prova_salva": 3.0, "criacao_anotacao_relatorio": 3.0, "criacao_turma_relatorio": 3.0,
+}
+
+df_clean["weight"] = df_clean["event_type"].map(weight_map).fillna(0.2).astype("float32")
+```
+
+```{python}
+freq = (df_clean['weight']
+        .value_counts()                 # conta cada valor
+        .rename_axis('weight')          # nomeia o índice
+        .reset_index(name='quantidade') # vira DataFrame
+        .sort_values('weight'))        
+print(freq)
+```
+
+```{python}
+agg = (df_clean.groupby(["unique_id","id_aula"])
+         .agg({"weight":"sum"})
+         .reset_index()
+         .rename(columns={"unique_id":"userId","id_aula":"itemId","weight":"rating"}))
+```
+
+```{python}
+rating_dist = (
+    agg['rating']
+      .value_counts()            # conta quantas vezes cada rating aparece
+      .rename_axis('rating')     # nomeia o índice
+      .reset_index(name='quantidade')
+      .sort_values('rating')
+)
+print(rating_dist)
+```
+
+```{python}
+df2 = (df_clean.rename(columns={"unique_id":"userId","id_aula":"itemId","weight":"rating"}))
+print(df2.columns)
+```
+
+**Normalização do Rating**
+
+```{python}
+print(df2["rating"].describe())
+df2['rating'] = df2['rating'].astype('float32')
+```
+
+```{python}
+freq = (df2['rating'].value_counts()
+         .sort_index()
+         .to_frame('quantidade'))
+freq['percentual'] = (freq['quantidade'] / len(df2) * 100).round(2)
+print(freq)
+```
+
+```{python}
+freq = df2['rating'].value_counts().sort_index()  # Index = valores de weight, values = contagens
+
+weights = freq.index.to_numpy(dtype=float)
+counts  = freq.to_numpy()
+
+mass = (weights * counts).sum()                      # soma ponderada: Σ weight * quantidade
+share = (weights * counts) / mass * 100
+
+share_df = (
+    pd.DataFrame({'weight': weights,
+                  'quantidade': counts,
+                  'share_%': share.round(2)})
+)
+print(share_df)
+```
+
+```{python}
+df2["rating_log"] = np.log1p(df2["rating"])
+df2["rating_sqrt"] = np.sqrt(df2["rating"])
+```
+
+```{python}
+print("\nResumo estatístico:")
+print(df2[["rating", "rating_log", "rating_sqrt"]].describe())
+```
+
+```{python}
+df2["rating_raw"] = df2["rating"].astype(float)
+df2["rating_log"] = np.log1p(df2["rating_raw"])
+df2["rating_sqrt"] = np.sqrt(df2["rating_raw"])
+
+# Conferir
+print(df2[["rating", "rating_raw", "rating_log", "rating_sqrt"]].head())
+```
+
+#### Pré-processamento
+
+```{python}
+print("Users únicos:", df2["userId"].nunique())
+print("Itens únicos:", df2["itemId"].nunique())
+```
+
+```{python}
+# ---------- CONFIG ----------
+DATE_MIN = "2024-01-01"             # foco em +recente
+EXCLUDE_SOURCES = {"menu", "busca"} # fontes ruidosas
+KEEP_LAST_PER_USER = 100            # últimas interações por usuário (50–200)
+MIN_U, MIN_I = 2, 3                 # esparsidade (3 no item ajuda recall)
+TAU_DAYS = 60.0                     # decaimento temporal (30–90)
+RATING_PREF = ["rating_log","rating","rating_sqrt","rating_raw"]  # ordem de preferência
+
+assert 'df2' in globals(), "Preciso do df2 carregado."
+
+# --- escolher rating disponível ---
+rating_col = next((c for c in RATING_PREF if c in df2.columns), None)
+df = df2.copy()
+if rating_col is None:
+    rating_col = 'rating'
+    df[rating_col] = 0.2
+df[rating_col] = pd.to_numeric(df[rating_col], errors='coerce').fillna(1.0).astype('float32')
+
+# --- colunas de trabalho ---
+cols = ["userId","itemId", rating_col, "data_inicio", "utm_source"]
+cols = [c for c in cols if c in df.columns]
+df = df.loc[:, cols].copy()
+df[rating_col] = pd.to_numeric(df[rating_col], errors="coerce").fillna(1.0).astype("float32")
+if "data_inicio" in df:  # garantir datetime
+    df["data_inicio"] = pd.to_datetime(df["data_inicio"], errors="coerce")
+
+# --- ids válidos + rating numérico > 0 ---
+mask = df["userId"].notna() & df["itemId"].notna() \
+       & (df["userId"].astype(str) != "") & (df["itemId"].astype(str) != "")
+df = df.loc[mask].copy()
+df[rating_col] = pd.to_numeric(df[rating_col], errors="coerce").fillna(0).astype("float32")
+df = df.loc[df[rating_col] > 0].copy()
+
+# --- tempo + janela recente ---
+if "data_inicio" in df.columns:
+    df["data_inicio"] = pd.to_datetime(df["data_inicio"], errors="coerce")
+    df = df.dropna(subset=["data_inicio"])
+    df = df.loc[df["data_inicio"] >= DATE_MIN].copy()
+
+# --- filtrar fontes ruidosas (se existir utm_source) ---
+if "utm_source" in df.columns:
+    df = df.loc[~df["utm_source"].isin(EXCLUDE_SOURCES)].copy()
+
+# --- ordenar + cap por usuário (últimas N) ---
+if "data_inicio" in df.columns:
+    df = df.sort_values(["userId","data_inicio"])
+    df = df.groupby("userId", group_keys=False).tail(KEEP_LAST_PER_USER)
+
+# --- deduplicar user-item: manter último timestamp e maior rating ---
+agg = {}
+if "data_inicio" in df.columns: agg["data_inicio"] = "max"
+agg[rating_col] = "max"
+df = df.groupby(["userId","itemId"], as_index=False).agg(agg)
+
+# --- decaimento temporal no rating ---
+if "data_inicio" in df.columns:
+    max_ts = df["data_inicio"].max()
+    age_days = (max_ts - df["data_inicio"]).dt.days.clip(lower=0).astype("float32")
+    decay = np.exp(-age_days / TAU_DAYS).astype("float32")
+else:
+    decay = np.ones(len(df), dtype="float32")
+
+df["w_rating"] = (df[rating_col].values * decay).astype("float32")
+
+# --- filtros de esparsidade (depois do peso) ---
+uc = df.groupby("userId")["itemId"].transform("count")
+ic = df.groupby("itemId")["userId"].transform("count")
+df = df.loc[(uc >= MIN_U) & (ic >= MIN_I)].copy()
+
+print(f"[DADOS] linhas={len(df):,} | users={df['userId'].nunique():,} | itens={df['itemId'].nunique():,}")
+```
+
+```{python}
+# --- mapear para índices inteiros estáveis ---
+u_cat = pd.Categorical(df["userId"].astype("string"))
+i_cat = pd.Categorical(df["itemId"].astype("string"))
+df["u_idx"] = u_cat.codes
+df["i_idx"] = i_cat.codes
+df = df.loc[(df["u_idx"] >= 0) & (df["i_idx"] >= 0)].copy()
+
+n_users = int(df["u_idx"].max()) + 1
+n_items = int(df["i_idx"].max()) + 1
+
+# --- split: última interação por usuário no TESTE (resto no TREINO) ---
+df = df.sort_values(["u_idx","data_inicio"])
+last_idx = df.groupby("u_idx", sort=False).tail(1).index
+test_mask = df.index.isin(last_idx)
+
+train_df = df.loc[~test_mask, ["u_idx","i_idx","w_rating"]].rename(columns={"w_rating":"rating"})
+test_df  = df.loc[ test_mask, ["u_idx","i_idx","w_rating"]].rename(columns={"w_rating":"rating"})
+
+# garantir que user/item do teste existem no treino
+U_tr = set(train_df["u_idx"].unique()); I_tr = set(train_df["i_idx"].unique())
+test_df = test_df.loc[test_df["u_idx"].isin(U_tr) & test_df["i_idx"].isin(I_tr)].copy()
+
+```
+
+```{python}
+# --- remap ESTÁVEL a partir do TREINO ---
+u_train = pd.Index(train_df['u_idx'].unique(), name='u_idx')
+i_train = pd.Index(train_df['i_idx'].unique(), name='i_idx')
+
+u_map = pd.Series(np.arange(len(u_train), dtype=np.int32), index=u_train)
+i_map = pd.Series(np.arange(len(i_train), dtype=np.int32), index=i_train)
+
+# aplica remapeamento no treino
+train_df = train_df.assign(
+    u = train_df['u_idx'].map(u_map).astype(np.int32),
+    i = train_df['i_idx'].map(i_map).astype(np.int32)
+)
+
+# mantém no teste apenas (u,i) presentes no TREINO e remapeia
+test_df = test_df[
+    test_df['u_idx'].isin(u_map.index) & test_df['i_idx'].isin(i_map.index)
+].assign(
+    u = test_df['u_idx'].map(u_map).astype(np.int32),
+    i = test_df['i_idx'].map(i_map).astype(np.int32)
+).copy()
+
+n_users = len(u_map); n_items = len(i_map)
+
+u_vals = np.sort(train_df['u_idx'].unique())
+i_vals = np.sort(train_df['i_idx'].unique())
+
+u_map = pd.Series(np.arange(u_vals.size, dtype=np.int32), index=u_vals)
+i_map = pd.Series(np.arange(i_vals.size, dtype=np.int32), index=i_vals)
+
+# aplica no TREINO
+train_df = train_df.assign(
+    u = train_df['u_idx'].map(u_map).astype(np.int32),
+    i = train_df['i_idx'].map(i_map).astype(np.int32)
+)
+
+# filtra e aplica no TESTE (somente user/item que existem no treino)
+test_df = test_df[
+    test_df['u_idx'].isin(u_map.index) & test_df['i_idx'].isin(i_map.index)
+].assign(
+    u = test_df['u_idx'].map(u_map).astype(np.int32),
+    i = test_df['i_idx'].map(i_map).astype(np.int32)
+).copy()
+
+# dimensões derivadas do TREINO já remapeado
+n_users = int(train_df['u'].max()) + 1
+n_items = int(train_df['i'].max()) + 1
+
+# ========= CSR user×item (apenas TREINO é necessário) =========
+from scipy.sparse import csr_matrix
+
+train_csr = csr_matrix(
+    (train_df['rating'].to_numpy(np.float32), (train_df['u'], train_df['i'])),
+    shape=(n_users, n_items), dtype=np.float32
+).tocsr()
+
+print('[CSR]', train_csr.shape, 'nnz=', f'{train_csr.nnz:,}')
+```
+
+### Modelagem
+
+```{python}
+xxx
+```
+
+```{python}
+# ===== 1) BM25 na matriz de treino (USER x ITEM) =====
+BM25_K1 = 120
+BM25_B  = 0.273
+ALS_REG = 0.0273
+ALS_ALPHA = 1.5872093023255816
+ALS_FACT = 128     
+ALS_ITERS   = 20
+
+train_bm25 = bm25_weight(train_csr, K1=BM25_K1, B=BM25_B).astype('float32')
+train_conf = (train_bm25 * ALS_ALPHA).T  # ITEM x USER
+
+model = AlternatingLeastSquares(
+    factors=ALS_FACT, regularization=ALS_REG, iterations=ALS_ITERS, dtype=np.float32
+)
+model.fit(train_conf)
+
+# sanidade: dimensões do modelo devem bater com a CSR
+assert model.user_factors.shape[0] == train_csr.shape[0]
+assert model.item_factors.shape[0] == train_csr.shape[1]
+
+# ========= Avaliação LOO @K com guarda-defensiva =========
+K = 10
+user_cap = model.user_factors.shape[0]
+item_cap = model.item_factors.shape[0]
+
+valid = (test_df['u'].between(0, user_cap-1)) & (test_df['i'].between(0, item_cap-1))
+if not valid.all():
+    # opcional: inspecione casos fora de faixa
+    print('Descartando fora de faixa:', (~valid).sum(), 'linhas')
+test_eval = test_df.loc[valid, ['u','i']].to_numpy()
+
+precisions, recalls = [], []
+for u, true_i in test_eval:
+    rec_ids, _ = model.recommend(u, train_csr[u], N=K, filter_already_liked_items=True)
+    hit = 1 if true_i in rec_ids else 0
+    precisions.append(hit / K); recalls.append(hit)
+
+P_als = float(np.mean(precisions))
+R_als = float(np.mean(recalls))
+print({'K': K, 'ALS': {'precision': round(P_als,4), 'recall': round(R_als,4)}})
+```
