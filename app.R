@@ -483,5 +483,5 @@ server <- function(input, output, session){
 
 shinyApp(ui, server)
 
-app <- shiny::shinyApp(ui, server)
-if (interactive()) shiny::runApp(app)
+app <- shiny::shinyApp(ui = ui, server = server)
+app 
