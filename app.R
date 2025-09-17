@@ -15,6 +15,8 @@ suppressPackageStartupMessages({
   library(reticulate)
 })
 
+try(reticulate::py_config(), silent = TRUE)
+
 # RcppCNPy é opcional (usamos reticulate como fallback)
 has_rcppcnpy <- requireNamespace("RcppCNPy", quietly = TRUE)
 has_reticulate <- requireNamespace("reticulate", quietly = TRUE)
