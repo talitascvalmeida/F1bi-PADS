@@ -3,6 +3,6 @@ Package: f1bi-recs
 Title: Fundação 1Bi — Recomendador
 Version: 0.0.1
 Encoding: UTF-8
-# Lista de pacotes R que o Connect deve instalar
+Depends: R (>= 4.0)
 Imports:
     reticulate
