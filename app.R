@@ -1,5 +1,5 @@
-# app.R — Fundação 1Bi • Recomendador Top‑5 (ALS Implícito BM25)
-# Versão: 2025-09-17 — correção de parsing, nomes garantidos e blindagem NPY
+# app.R — Fundação 1Bi • Recomendador Top-5 (ALS Implícito BM25)
+# Versão: 2025-09-17 — prioriza RDS p/ fatores, evita segfaults de NPY
 
 # =====================
 # Pacotes
@@ -12,14 +12,8 @@ suppressPackageStartupMessages({
   library(stringr)
   library(tibble)
   library(tidyr)
-  library(reticulate)
+  # opcional: reticulate só será usado se existir, não é obrigatório
 })
-
-try(reticulate::py_config(), silent = TRUE)
-
-# RcppCNPy é opcional (usamos reticulate como fallback)
-has_rcppcnpy <- requireNamespace("RcppCNPy", quietly = TRUE)
-has_reticulate <- requireNamespace("reticulate", quietly = TRUE)
 
 # =====================
 # Tema (CSS)
@@ -35,7 +29,6 @@ CIRCLED <- setNames(intToUtf8(9311 + 1:10, multiple = TRUE), as.character(1:10))
 ARTIFACTS_DIR <- "artifacts"
 SCORE_PRESENTATION <- "bucket"  # "softmax" | "bucket" | "hide"
 SOFTMAX_BETA <- 3
-
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 
 norm_key <- function(x){
@@ -53,17 +46,14 @@ score_presentation <- function(scores, mode = SCORE_PRESENTATION, beta = SOFTMAX
   if (length(s) == 0 || all(!is.finite(s))) return(list(text = rep("", length(s)), prob = rep(NA_real_, length(s))))
   if (mode == "hide") return(list(text = rep("", length(s)), prob = rep(NA_real_, length(s))))
   if (mode == "softmax"){
-    m <- max(s, na.rm = TRUE)
-    z <- s - m
-    p <- exp(beta * z)
-    p <- p / sum(p, na.rm = TRUE)
+    m <- max(s, na.rm = TRUE); z <- s - m
+    p <- exp(beta * z); p <- p / sum(p, na.rm = TRUE)
     txt <- paste0(round(100 * p), "%")
     return(list(text = txt, prob = p))
   }
   if (mode == "bucket"){
     rng <- range(s[is.finite(s)])
-    denom <- rng[2] - rng[1]
-    if (!is.finite(denom) || denom == 0) denom <- 1
+    denom <- rng[2] - rng[1]; if (!is.finite(denom) || denom == 0) denom <- 1
     z <- (s - rng[1]) / denom
     lab <- ifelse(z >= 0.75, "Alta", ifelse(z >= 0.45, "Média", "Baixa"))
     return(list(text = lab, prob = z))
@@ -84,19 +74,16 @@ add_score_column <- function(df){
   if (is.null(nm) || !"score" %in% names(df)) return(df)
   if ("userId" %in% names(df)){
     df %>% group_by(userId) %>% group_modify(function(.x, .k){
-      sp <- score_presentation(.x$score)
-      .x[[nm]] <- sp$text
-      .x
+      sp <- score_presentation(.x$score); .x[[nm]] <- sp$text; .x
     }) %>% ungroup()
   } else {
-    sp <- score_presentation(df$score)
-    df[[nm]] <- sp$text
-    df
+    sp <- score_presentation(df$score); df[[nm]] <- sp$text; df
   }
 }
 
 .has_required <- function(d){
-  file.exists(file.path(d, "item_factors.npy")) &&
+  file.exists(file.path(d, "item_factors.rds")) || file.exists(file.path(d, "item_factors.parquet")) ||
+    file.exists(file.path(d, "item_factors.npy")) &&
     (file.exists(file.path(d, "item_index.parquet")) || file.exists(file.path(d, "item_index.csv")))
 }
 
@@ -123,8 +110,26 @@ resolve_champ_dir <- function(){
   dirs <- list.dirs(ARTIFACTS_DIR, recursive = FALSE, full.names = TRUE)
   champs <- dirs[grepl("^champ_", basename(dirs))]
   valid <- Filter(.has_required, champs)
-  if (!length(valid)) stop("Nenhum champ_* válido com item_index.(parquet|csv) + item_factors.npy em 'artifacts/'.")
+  if (!length(valid)) stop("Nenhum champ_* válido com item_index.(parquet|csv) + item_factors.{rds|parquet|npy} em 'artifacts/'.")
   valid[which.max(file.info(valid)$mtime)]
+}
+
+# ---------- NOVO: loader que PRIORIZA .RDS, depois .parquet e por fim .npy ----------
+safe_load_matrix <- function(champ, base){
+  p_rds  <- file.path(champ, paste0(base, ".rds"))
+  if (file.exists(p_rds)) return(readRDS(p_rds))
+
+  p_parq <- file.path(champ, paste0(base, ".parquet"))
+  if (file.exists(p_parq)) return(as.matrix(arrow::read_parquet(p_parq)))
+
+  p_npy  <- file.path(champ, paste0(base, ".npy"))
+  if (file.exists(p_npy) && requireNamespace("reticulate", quietly = TRUE)){
+    np <- reticulate::import("numpy", delay_load = TRUE)
+    arr <- np$load(p_npy, allow_pickle = FALSE)
+    return(reticulate::py_to_r(arr))
+  }
+
+  stop(sprintf("Não consegui carregar %s.{rds|parquet|npy} em %s", base, champ))
 }
 
 load_catalog <- function(champ_dir){
@@ -147,8 +152,7 @@ load_catalog <- function(champ_dir){
   first_present <- function(cands, pool){
     pool_l <- tolower(pool)
     for (c in cands){
-      pos <- match(tolower(c), pool_l)
-      if (!is.na(pos)) return(pool[pos])
+      pos <- match(tolower(c), pool_l); if (!is.na(pos)) return(pool[pos])
     }
     NULL
   }
@@ -157,32 +161,22 @@ load_catalog <- function(champ_dir){
     raw <- tryCatch(read_any(p), error = function(e) NULL)
     if (is.null(raw) || nrow(raw) == 0) next
     cols <- colnames(raw)
-    col_item <- first_present(
-      c("itemId","lesson_id","lessonId","id_aula","conteudo_id","content_id","id","lesson","lessonid"),
-      cols
-    )
-    col_name <- first_present(
-      c("itemName","lesson_title","lessonTitle","titulo","nome","name","title","descricao","description"),
-      cols
-    )
+    col_item <- first_present(c("itemId","lesson_id","lessonId","id_aula","conteudo_id","content_id","id","lesson","lessonid"), cols)
+    col_name <- first_present(c("itemName","lesson_title","lessonTitle","titulo","nome","name","title","descricao","description"), cols)
     col_url  <- first_present(c("itemUrl","url","link","href"), cols)
     col_disc <- first_present(c("disciplina","subject","materia","disciplina_nome","subject_name"), cols)
     if (is.null(col_item) || is.null(col_name)) next
-
     keep <- c(col_item, col_name, col_url, col_disc)
     keep <- keep[!sapply(keep, is.null)]
     out <- raw[, keep, drop = FALSE]
-
     names(out)[match(col_item, names(out))] <- "itemId"
     names(out)[match(col_name, names(out))] <- "itemName"
     if (!is.null(col_url))  names(out)[match(col_url, names(out))]  <- "itemUrl"
     if (!is.null(col_disc)) names(out)[match(col_disc, names(out))] <- "disciplina"
-
     out$itemId   <- as.character(out$itemId)
     out$itemName <- as.character(out$itemName)
     if ("itemUrl" %in% names(out))    out$itemUrl <- as.character(out$itemUrl)
     if ("disciplina" %in% names(out)) out$disciplina <- as.character(out$disciplina)
-
     out <- distinct(drop_na(out, itemId, itemName), itemId, .keep_all = TRUE)
     out$join_key <- norm_key(out$itemId)
     message(sprintf("Catálogo carregado de: %s | linhas: %d", p, nrow(out)))
@@ -191,46 +185,27 @@ load_catalog <- function(champ_dir){
   tibble(itemId = character(), itemName = character(), itemUrl = character(), join_key = character())
 }
 
-safe_file_nonempty <- function(p){
-  fi <- suppressWarnings(file.info(p))
-  isTRUE(!is.na(fi$size) && fi$size > 0 && !isTRUE(fi$isdir))
-}
-
-safe_npy_load <- function(path){
-  stopifnot(file.exists(path))
-  # Preferimos numpy via reticulate (evita segfaults do C++)
-  if (has_reticulate){
-    np <- reticulate::import("numpy", delay_load = TRUE)
-    arr <- np$load(path, allow_pickle = FALSE)
-    return(reticulate::py_to_r(arr))
-  }
-  if (has_rcppcnpy){
-    return(RcppCNPy::npyLoad(path))
-  }
-  stop("Nem reticulate+numpy nem RcppCNPy disponíveis para ler NPY.")
-}
-
 load_artifacts <- function(){
   champ <- resolve_champ_dir()
   message("Usando champ: ", champ)
 
   item_index   <- .read_item_index(champ)
-  item_factors <- safe_npy_load(file.path(champ, "item_factors.npy"))
+  item_factors <- safe_load_matrix(champ, "item_factors")
 
-  user_index <- NULL
-  user_factors <- NULL
+  user_index <- NULL; user_factors <- NULL
   p_uidx <- file.path(champ, "user_index.parquet")
-  p_ufac <- file.path(champ, "user_factors.npy")
-  if (file.exists(p_uidx) && file.exists(p_ufac) && safe_file_nonempty(p_ufac)){
-    user_index   <- as.data.frame(arrow::read_parquet(p_uidx))
-    user_factors <- safe_npy_load(p_ufac)
+  if (file.exists(p_uidx)){
+    user_index <- as.data.frame(arrow::read_parquet(p_uidx))
+    if (file.exists(file.path(champ, "user_factors.rds")) ||
+        file.exists(file.path(champ, "user_factors.parquet")) ||
+        file.exists(file.path(champ, "user_factors.npy"))){
+      user_factors <- safe_load_matrix(champ, "user_factors")
+    }
   }
 
   topn_df <- NULL
-  topn_path <- file.path(champ, "topN_user.parquet")
-  if (file.exists(topn_path)){
-    topn_df <- as.data.frame(arrow::read_parquet(topn_path))
-  }
+  p_topn <- file.path(champ, "topN_user.parquet")
+  if (file.exists(p_topn)) topn_df <- as.data.frame(arrow::read_parquet(p_topn))
 
   if (!is.null(topn_df) && all(c("itemId","rank") %in% names(topn_df))){
     pop <- topn_df %>%
@@ -247,28 +222,25 @@ load_artifacts <- function(){
 
   catalog <- load_catalog(champ)
 
-  list(
-    topn_df = topn_df,
-    item_index = item_index,
-    item_factors = item_factors,
-    user_index = user_index,
-    user_factors = user_factors,
-    popularity = pop,
-    catalog = catalog
-  )
+  list(topn_df = topn_df,
+       item_index = item_index,
+       item_factors = item_factors,
+       user_index = user_index,
+       user_factors = user_factors,
+       popularity = pop,
+       catalog = catalog)
 }
 
 ART <- load_artifacts()
 ITEMID_TO_IIDX <- setNames(ART$item_index$i_idx, as.character(ART$item_index$itemId))
 USERID_TO_UIDX <- if (is.null(ART$user_index)) character(0) else setNames(ART$user_index$u_idx, as.character(ART$user_index$userId))
-
 assign("ART", ART, envir = .GlobalEnv)
 assign("ITEMID_TO_IIDX", ITEMID_TO_IIDX, envir = .GlobalEnv)
 assign("USERID_TO_UIDX", USERID_TO_UIDX, envir = .GlobalEnv)
 
-# Log da cobertura de nomes
+# Cobertura de nomes (log informativo)
 try({
-  if (!is.null(ART$catalog) && nrow(ART$catalog) > 0) {
+  if (!is.null(ART$catalog) && nrow(ART$catalog) > 0){
     idx <- ART$item_index %>% mutate(join_key = norm_key(as.character(itemId)))
     cat_tbl <- ART$catalog
     if (!"join_key" %in% names(cat_tbl)) cat_tbl$join_key <- norm_key(as.character(cat_tbl$itemId))
@@ -280,71 +252,34 @@ try({
   }
 }, silent = TRUE)
 
-# ============
-# NOMES: join robusto (normalizado + itemId cru)
-# ============
 enrich_with_names <- function(df){
   if (is.null(df) || nrow(df) == 0) return(df)
-
-  # Se não há catálogo, devolve o próprio itemId como nome
   if (is.null(ART$catalog) || nrow(ART$catalog) == 0){
-    df$itemName <- as.character(df$itemId)
-    return(df)
+    df$itemName <- as.character(df$itemId); return(df)
   }
-
-  out <- df %>%
-    mutate(itemId = as.character(itemId),
-           join_key = norm_key(itemId))
-
+  out <- df %>% mutate(itemId = as.character(itemId), join_key = norm_key(itemId))
   cat_tbl <- ART$catalog
-
-  # Garante tipos e chaves no catálogo
-  if (!"join_key" %in% names(cat_tbl)) {
-    if (!"itemId" %in% names(cat_tbl)) {
-      possible_item_cols <- intersect(c("lesson_id","id_aula","conteudo_id","content_id","id","lesson","lessonid"), names(cat_tbl))
-      if (length(possible_item_cols)) {
-        cat_tbl$itemId <- as.character(cat_tbl[[possible_item_cols[1]]])
-      } else {
-        out$itemName <- out$itemId
-        out$join_key <- NULL
-        return(out)
+  if (!"join_key" %in% names(cat_tbl)){
+    if (!"itemId" %in% names(cat_tbl)){
+      possible <- intersect(c("lesson_id","id_aula","conteudo_id","content_id","id","lesson","lessonid"), names(cat_tbl))
+      if (length(possible)) cat_tbl$itemId <- as.character(cat_tbl[[possible[1]]]) else {
+        out$itemName <- out$itemId; out$join_key <- NULL; return(out)
       }
     }
     cat_tbl$itemId <- as.character(cat_tbl$itemId)
     cat_tbl$join_key <- norm_key(cat_tbl$itemId)
   }
-
-  # 1) Join pela chave normalizada
-  joined <- out %>%
-    left_join(
-      cat_tbl %>% select(join_key, itemName, any_of(c("itemUrl","disciplina"))),
-      by = "join_key"
-    )
-
-  # 2) Fallback: join direto por itemId para preencher NAs
+  joined <- out %>% left_join(cat_tbl %>% select(join_key, itemName, any_of(c("itemUrl","disciplina"))), by = "join_key")
   need_fill <- is.na(joined$itemName) | joined$itemName == ""
-  if (any(need_fill)) {
-    joined2 <- joined %>%
-      left_join(
-        cat_tbl %>% transmute(itemId = as.character(itemId), itemName_fallback = as.character(itemName)),
-        by = "itemId"
-      )
+  if (any(need_fill)){
+    joined2 <- joined %>% left_join(cat_tbl %>% transmute(itemId = as.character(itemId), itemName_fallback = as.character(itemName)), by = "itemId")
     joined2$itemName <- ifelse(need_fill, joined2$itemName_fallback, joined2$itemName)
     joined <- joined2 %>% select(-itemName_fallback)
   }
-
-  # 3) Último recurso: usa o próprio itemId
-  joined$itemName <- ifelse(is.na(joined$itemName) | joined$itemName == "",
-                            as.character(joined$itemId),
-                            joined$itemName)
-
+  joined$itemName <- ifelse(is.na(joined$itemName) | joined$itemName == "", as.character(joined$itemId), joined$itemName)
   joined$join_key <- NULL
   joined
 }
-
-# ============
-# Recomendação
-# ============
 
 topk_from_scores <- function(scores, k = TOPK){
   k <- max(1L, min(as.integer(k), length(scores)))
@@ -359,7 +294,6 @@ topk_from_scores <- function(scores, k = TOPK){
 recommend_known_user <- function(user_id, k = TOPK){
   uid <- str_trim(as.character(user_id))
 
-  # 1) Se existir topN pré-computado por usuário, usa
   if (!is.null(ART$topn_df) && nrow(ART$topn_df) > 0){
     sub <- ART$topn_df %>% filter(as.character(userId) == uid)
     if (nrow(sub) > 0){
@@ -370,17 +304,14 @@ recommend_known_user <- function(user_id, k = TOPK){
     }
   }
 
-  # 2) Se usuário conhecido e temos user_factors, faz produto interno
   if (uid %in% names(USERID_TO_UIDX) && !is.null(ART$user_factors)){
     u_idx <- USERID_TO_UIDX[[uid]]
     u_vec <- ART$user_factors[u_idx + 1, , drop = TRUE]
-    denom <- sqrt(sum(u_vec^2))
-    if (!is.finite(denom) || denom == 0) denom <- 1
+    denom <- sqrt(sum(u_vec^2)); if (!is.finite(denom) || denom == 0) denom <- 1
     scores <- as.numeric(ART$item_factors %*% (u_vec / denom))
     return(topk_from_scores(scores, k = k))
   }
 
-  # 3) Senão, usa popularidade (proxy)
   pop <- ART$popularity %>% head(k) %>% transmute(itemId, score = as.numeric(freq)) %>% mutate(rank = dplyr::row_number())
   enrich_with_names(pop)
 }
@@ -410,8 +341,7 @@ format_table <- function(df){
   out$Item <- txt
   out <- add_score_column(out)
   score_nm <- score_col_name()
-  cols <- c("Rank", "Item", score_nm)
-  cols <- cols[!sapply(cols, is.null)]
+  cols <- c("Rank", "Item", score_nm); cols <- cols[!sapply(cols, is.null)]
   out[, intersect(cols, names(out)), drop = FALSE]
 }
 
@@ -477,7 +407,7 @@ server <- function(input, output, session){
     if (is.null(df)) return(tibble(`Erro ao ler CSV` = "Arquivo inválido."))
     if (!"userId" %in% names(df)) return(tibble(erro = "CSV deve conter coluna 'userId'"))
     uids <- df$userId %>% as.character() %>% str_trim()
-    uids <- unique(uids[uids != ""]) 
+    uids <- unique(uids[uids != ""])
     if (length(uids) == 0) return(tibble(erro = "Nenhum userId válido encontrado."))
     out <- recommend_user_batch(uids, k = TOPK)
     cache(out)
@@ -491,8 +421,7 @@ server <- function(input, output, session){
     prev$Item <- txt
     prev <- add_score_column(prev)
     score_nm <- score_col_name()
-    cols <- c("userId", "Rank", "Item", score_nm)
-    cols <- cols[cols %in% names(prev)]
+    cols <- c("userId", "Rank", "Item", score_nm); cols <- cols[cols %in% names(prev)]
     prev %>% select(dplyr::all_of(cols))
   })
 
