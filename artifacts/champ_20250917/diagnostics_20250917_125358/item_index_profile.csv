@@ -1,0 +1,2 @@
+n,n_distinct,len_min,len_p25,len_med,len_p75,len_max,p_only_digits,p_has_letter,p_looks_json,p_looks_url
+2132,2132,21,22,22,22,22,0,1,0,0
