@@ -12,6 +12,7 @@ suppressPackageStartupMessages({
   library(stringr)
   library(tibble)
   library(tidyr)
+  library(reticulate)
 })
 
 # RcppCNPy é opcional (usamos reticulate como fallback)
